@@ -251,69 +251,85 @@ namespace PuzzlePlatform.Core
 					continue;
 				}
 
-				// Check for continuous movement
-				List<Vector3> path = new List<Vector3>();
-				path.Add(platformPosition);
-				
-				int steps = GetConsecutiveSteps(currentCommandIndex, direction);
-				Vector3 targetPosition = platformPosition;
-				bool pathValid = true;
+				// Calculate movement path with continuous movement
+				List<Vector3> movementPath = new List<Vector3> { platformPosition };
+				List<MovementCommand> pathCommands = new List<MovementCommand>();
+				int consecutiveSteps = 0;
+				int lookAheadIndex = currentCommandIndex;
+				bool hitObstacle = false;
 
-				// Validate the entire path before moving
-				for (int i = 0; i < steps; i++)
+				// Validate entire path before moving
+				while (lookAheadIndex < commandList.Count && independentSettings.enableContinuousMovement)
 				{
-					Vector3 nextPosition = targetPosition + direction;
-					if (!IsValidMove(nextPosition))
+					MovementCommand nextCmd = commandList[lookAheadIndex];
+					if (nextCmd == MovementCommand.Wait) break;
+
+					Vector3 nextDir = GetDirectionFromCommand(nextCmd);
+					if (nextDir != direction) break;
+
+					Vector3 nextPos = movementPath[^1] + Vector3.Scale(nextDir, (Vector3)gridSize);
+					
+					// Check if next position is valid using bounds-based detection
+					if (!IsValidMove(nextPos))
 					{
-						pathValid = false;
-						steps = i;
+						hitObstacle = IsCellOccupied(GetPlatformBounds());
 						break;
 					}
-					path.Add(nextPosition);
-					targetPosition = nextPosition;
+
+					movementPath.Add(nextPos);
+					pathCommands.Add(nextCmd);
+					consecutiveSteps++;
+					lookAheadIndex++;
 				}
 
-				if (steps > 0)
+				// If no continuous movement or only one step
+				if (consecutiveSteps == 0)
 				{
-					// Store commands that will be executed
-					for (int i = 0; i < steps; i++)
+					Vector3 nextPos = platformPosition + Vector3.Scale(direction, (Vector3)gridSize);
+					
+					if (!IsValidMove(nextPos))
 					{
-						executedCommands.Push(commandList[currentCommandIndex + i]);
-					}
-
-					if (independentSettings.enableContinuousMovement && steps > 1)
-					{
-						yield return StartCoroutine(SmoothMove(path));
-					}
-					else
-					{
-						// Execute single moves
-						foreach (Vector3 point in path.Skip(1))
+						DebugLog($"Obstacle or boundary detected, starting reverse sequence");
+						if (isInitialMove)
 						{
-							if (!IsValidMove(point))
-							{
-								StartReverseSequence();
-								yield break;
-							}
-							platformPosition = point;
-							UpdatePlatformTransform();
-							yield return new WaitForSeconds(1f / independentSettings.moveSpeed);
+							DebugLog("Obstacle detected on first move, immediate reverse");
+							SetState(PlatformState.Idle);
+							isPlaying = false;
+							yield break;
 						}
+						StartReverseSequence();
+						yield break;
 					}
 
-					currentCommandIndex += steps;
+					movementPath.Add(nextPos);
+					pathCommands.Add(command);
+				}
 
-					// If path was cut short by an obstacle
-					if (!pathValid)
+				// Execute movement if path is valid
+				if (movementPath.Count > 1)
+				{
+					DebugLog($"Starting movement over {movementPath.Count - 1} tiles");
+					
+					// Add commands to executed stack before movement
+					foreach (var cmd in pathCommands)
 					{
+						executedCommands.Push(cmd);
+					}
+
+					yield return StartCoroutine(SmoothMove(movementPath));
+					
+					DebugLog("Movement completed");
+
+					if (hitObstacle)
+					{
+						DebugLog("Obstacle detected after continuous movement, starting reverse sequence");
 						StartReverseSequence();
 						yield break;
 					}
 				}
-				else
-				{
-					currentCommandIndex++;
-				}
+
+				currentCommandIndex += pathCommands.Count;
+				isInitialMove = false;
 			}
 
 			SetState(PlatformState.Idle);
@@ -372,13 +388,39 @@ namespace PuzzlePlatform.Core
 			float moveTime = totalDistance / moveSpeed;
 			float currentDistance = 0f;
 
+			// Apply acceleration curve
+			float accelerationProgress = 0f;
+			float accelerationDuration = independentSettings.accelerationTime;
+			float decelerationStart = moveTime - independentSettings.decelerationTime;
+
 			while (moveProgress < 1f)
 			{
-				moveProgress += Time.deltaTime / moveTime;
+				float deltaTime = Time.deltaTime;
+				
+				// Calculate speed multiplier based on acceleration/deceleration
+				float currentTime = moveProgress * moveTime;
+				float speedMultiplier = 1f;
+				
+				if (currentTime < accelerationDuration)
+				{
+					// Acceleration phase
+					accelerationProgress = currentTime / accelerationDuration;
+					speedMultiplier = independentSettings.movementCurve.Evaluate(accelerationProgress);
+				}
+				else if (currentTime > decelerationStart)
+				{
+					// Deceleration phase
+					float decelerationProgress = (currentTime - decelerationStart) / independentSettings.decelerationTime;
+					speedMultiplier = independentSettings.movementCurve.Evaluate(1f - decelerationProgress);
+				}
+
+				moveProgress += (deltaTime * speedMultiplier) / moveTime;
 				moveProgress = Mathf.Clamp01(moveProgress);
 
 				// Calculate the target position along the path
 				float targetDistance = moveProgress * totalDistance;
+				
+				// Find current segment
 				while (currentPathIndex < path.Count - 1 && 
 					   currentDistance + Vector3.Distance(path[(int)currentPathIndex], path[(int)currentPathIndex + 1]) < targetDistance)
 				{
@@ -391,19 +433,25 @@ namespace PuzzlePlatform.Core
 				float segmentProgress = (targetDistance - currentDistance) / Vector3.Distance(currentPoint, nextPoint);
 				Vector3 targetPosition = Vector3.Lerp(currentPoint, nextPoint, segmentProgress);
 
-				// Check if the move is valid
+				// Check for obstacles using bounds-based detection
 				if (!IsValidMove(targetPosition))
 				{
-					// If we hit an obstacle during smooth movement, stop and reverse
+					DebugLog("Obstacle detected during smooth movement");
+					// Store the last valid position
+					platformPosition = currentPoint;
+					UpdatePlatformTransform();
+					// Trigger reverse sequence
 					StartReverseSequence();
 					yield break;
 				}
 
+				// Update platform position
 				platformPosition = targetPosition;
 				UpdatePlatformTransform();
 				yield return null;
 			}
 
+			// Ensure we reach the exact target position
 			platformPosition = moveTargetPosition;
 			UpdatePlatformTransform();
 			isMoving = false;
